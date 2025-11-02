@@ -7,6 +7,9 @@ namespace Soffice.Controllers
 {
     public class ConvertController : Controller
     {
+
+        private const string SofficePath = "soffice";
+
         [HttpGet("/convert")]
         public IActionResult Index()
         {
@@ -14,48 +17,98 @@ namespace Soffice.Controllers
         }
 
         [HttpPost("/convert")]
+        public async Task<IActionResult> ConvertFlexible(IFormFile file, string format)
+        {
+            // === Validation ===
+            if (file == null || file.Length == 0)
+                return BadRequest("Aucun fichier envoyé.");
+
+            if (string.IsNullOrWhiteSpace(format) || !new[] { "ods", "xlsx" }.Contains(format.ToLower()))
+                return BadRequest("Format invalide : 'ods' ou 'xlsx'.");
+
+            string inputExt = Path.GetExtension(file.FileName).ToLower();
+            if (!new[] { ".xlsx", ".xls", ".ods" }.Contains(inputExt))
+                return BadRequest("Format non supporté : .xlsx, .xls ou .ods.");
+
+            string targetFormat = format.ToLower();
+            bool isXlsxToXlsx = inputExt == ".xlsx" && targetFormat == "xlsx";
+
+            // === Choix du traitement ===
+            return isXlsxToXlsx
+                ? await ConvertFile(file)
+                : await ConvertGeneric(file, targetFormat);
+        }
+        
+        private async Task<IActionResult> ConvertGeneric(IFormFile file, string targetFormat)
+        {
+            string inputExt = Path.GetExtension(file.FileName).ToLower();
+            string tempInput = Path.GetTempFileName() + inputExt;
+            string workingDir = Path.GetDirectoryName(tempInput)!;
+
+            try
+            {
+                using (var stream = System.IO.File.Create(tempInput))
+                    await file.CopyToAsync(stream);
+
+                string expectedOutput = Path.Combine(workingDir, Path.GetFileNameWithoutExtension(tempInput) + $".{targetFormat}");
+                await RunSoffice(SofficePath, tempInput, workingDir, targetFormat);
+
+                if (!System.IO.File.Exists(expectedOutput))
+                    return BadRequest($"Conversion échouée vers {targetFormat}.");
+
+                byte[] data = await System.IO.File.ReadAllBytesAsync(expectedOutput);
+                string fileName = Path.GetFileNameWithoutExtension(file.FileName) + $".{targetFormat}";
+
+                var contentType = targetFormat == "xlsx"
+                    ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    : "application/vnd.oasis.opendocument.spreadsheet";
+
+                return File(data, contentType, fileName);
+            }
+            finally
+            {
+                CleanupFiles(tempInput);
+            }
+        }
+        
         public async Task<IActionResult> ConvertFile(IFormFile file)
         {
             if (file == null || file.Length == 0)
                 return BadRequest("Aucun fichier envoyé.");
 
-            // Enregistrement temporaire du fichier source
-            // Path.GetTempFileName crée un fichier vide, on ajoute l'extension du fichier original
-            // On utilise Path.GetExtension pour conserver l'extension correcte
             string tempInput = Path.GetTempFileName() + Path.GetExtension(file.FileName);
-            using (var stream = System.IO.File.Create(tempInput)) // Crée le fichier, donc c'est un fichier vide
+            string workingDir = Path.GetDirectoryName(tempInput)!;
+
+            try
             {
-                await file.CopyToAsync(stream);  // Copie le contenu du fichier uploadé dans le fichier temporaire
+                using (var stream = System.IO.File.Create(tempInput))
+                    await file.CopyToAsync(stream);
+
+                // Étape 1 : XLSX → ODS
+                string tempOds = Path.Combine(workingDir, Path.GetFileNameWithoutExtension(tempInput) + ".ods");
+                await RunSoffice("soffice", tempInput, workingDir, "ods");
+
+                if (!System.IO.File.Exists(tempOds))
+                    return BadRequest("Échec : ODS intermédiaire non généré.");
+
+                // Étape 2 : ODS → XLSX
+                string finalXlsx = Path.Combine(workingDir, Path.GetFileNameWithoutExtension(tempOds) + ".xlsx");
+                await RunSoffice("soffice", tempOds, workingDir, "xlsx");
+
+                if (!System.IO.File.Exists(finalXlsx))
+                    return BadRequest("Échec : XLSX final non généré.");
+
+                byte[] data = await System.IO.File.ReadAllBytesAsync(finalXlsx);
+                string fileName = Path.GetFileNameWithoutExtension(file.FileName) + "_nettoye.xlsx";
+
+                return File(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fileName);
             }
-
-            string workingDir = Path.GetDirectoryName(tempInput)!;  // Dossier de travail pour les fichiers temporaires
-            string sofficePath = "soffice"; // ou le chemin complet, /usr/bin/soffice
-
-            // Étape 1 : XLSX → ODS
-            string tempOds = Path.ChangeExtension(tempInput, ".ods");
-            await RunSoffice(sofficePath, tempInput, workingDir, "ods");
-
-            // Étape 2 : ODS → XLSX
-            string finalXlsx = Path.ChangeExtension(tempInput, ".converted.xlsx");
-            await RunSoffice(sofficePath, tempOds, workingDir, "xlsx");
-
-            // Lecture du fichier final
-            string convertedFile = Path.ChangeExtension(tempOds, ".xlsx");
-            if (!System.IO.File.Exists(convertedFile))
-                return BadRequest("Fichier final introuvable.");
-
-
-            // Lire le fichier et le retourner
-            byte[] data = await System.IO.File.ReadAllBytesAsync(convertedFile);
-            string fileName = Path.GetFileNameWithoutExtension(file.FileName) + "_reconverti.xlsx";
-
-            // Nettoyage
-            System.IO.File.Delete(tempInput);
-            System.IO.File.Delete(tempOds);
-            System.IO.File.Delete(convertedFile);
-
-            // Retourner le fichier converti
-            return File(data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", fileName);
+            finally
+            {
+                CleanupFiles(tempInput, 
+                    Path.Combine(workingDir, Path.GetFileNameWithoutExtension(tempInput) + ".ods"),
+                    Path.Combine(workingDir, Path.GetFileNameWithoutExtension(tempInput) + ".xlsx"));
+            }
         }
 
         private async Task RunSoffice(string sofficePath, string inputFile, string outputDir, string outputFormat)
@@ -75,6 +128,13 @@ namespace Soffice.Controllers
             await process.StandardOutput.ReadToEndAsync();  // Lire la sortie standard (utile pour le débogage)
             await process.StandardError.ReadToEndAsync();   // Lire la sortie d'erreur (utile pour le débogage)
             await process.WaitForExitAsync();           // Attendre la fin du processus
+        }
+
+        // === Nettoyage ===
+        private void CleanupFiles(params string[] files)
+        {
+            foreach (var file in files)
+                try { if (System.IO.File.Exists(file)) System.IO.File.Delete(file); } catch { }
         }
     }
     
